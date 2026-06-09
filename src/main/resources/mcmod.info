@@ -1,0 +1,16 @@
+[
+  {
+    "modid": "modularmachinerygreggening",
+    "name": "Modular Machinery Greggening",
+    "description": "GregTech Inspired Features for Modular Machinery Community Edition",
+    "version": "${version}",
+    "mcversion": "${mcversion}",
+    "url": "https://curseforge.com/minecraft/mc-mods/TODO",
+    "updateUrl": "",
+    "authorList": ["Ming"],
+    "credits": "Thanks to the authors of Modular Machinery, MMCE, Modular Machinery: Addons, and others for inspiration and resources.",
+    "logoFile": "",
+    "screenshots": [],
+    "dependencies": []
+  }
+]

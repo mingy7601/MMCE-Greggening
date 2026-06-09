@@ -1,0 +1,503 @@
+package github.ming.mmcegreggening.common.hatch.appeng.itembus;
+
+import appeng.api.config.Actionable;
+import appeng.api.networking.energy.IEnergyGrid;
+import appeng.api.networking.IGrid;
+import appeng.api.networking.IGridNode;
+import appeng.api.networking.storage.IStorageGrid;
+import appeng.api.networking.ticking.IGridTickable;
+import appeng.api.networking.ticking.TickRateModulation;
+import appeng.api.networking.ticking.TickingRequest;
+import appeng.api.storage.IMEInventory;
+import appeng.api.storage.data.IAEItemStack;
+import appeng.api.storage.data.IItemList;
+import appeng.api.util.AEPartLocation;
+import github.ming.mmcegreggening.common.registry.ModularMachineryGreggeningBlocks;
+import github.alecsio.handler.AdaptiveSnapshotRefreshScheduler;
+import github.kasuminova.mmce.common.tile.base.MEItemBus;
+
+import hellfirepvp.modularmachinery.common.machine.IOType;
+import hellfirepvp.modularmachinery.common.machine.MachineComponent;
+import hellfirepvp.modularmachinery.common.util.IOInventory;
+import net.minecraft.item.Item;
+import net.minecraft.item.ItemStack;
+
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.util.*;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+/**
+ * Core tile entity for the Advanced ME Item Input Bus.
+ * <p>
+ * Extends MMCE's MEItemBus to reuse AE2 networking, capability exposure, and NBT handling.
+ * On load, performs an initial snapshot of available items from the connected AE2 network.
+ * When no AE2 channel is active (proxy inactive), does not tick or snapshot.
+ * Respects a configurable polling interval (default: 20 ticks / 1 second).
+ * <p>
+ * After draining items into inventory slots, re-snapshots to reflect updated AE2 availability.
+ */
+public class AdvancedMEItemInputBus extends MEItemBus implements IGridTickable {
+
+    /** Default polling interval in ticks (20 ticks = 1 second). */
+    public static final int DEFAULT_POLLING_INTERVAL_TICKS = 20;
+
+    /** Minimum polling interval in ticks. */
+    public static final int MIN_POLLING_INTERVAL_TICKS = 1;
+
+    /** Maximum polling interval in ticks (720000 = 10 hour). */
+    public static final int MAX_POLLING_INTERVAL_TICKS = 720000;
+
+    private static final int SLOT_COUNT = 16;
+
+    /** Snapshot of the top-16 most abundant item types, refreshed at polling intervals. */
+    protected volatile List<IAEItemStack> snapshot = new ArrayList<>();
+
+    /** Configurable polling interval in ticks (default: 20). */
+    private int pollingIntervalTicks = DEFAULT_POLLING_INTERVAL_TICKS;
+
+    /** Tick counter for the polling interval. */
+    private int tickCounter = 0;
+
+    /** Scheduler for adaptive snapshot refresh. */
+    protected final AdaptiveSnapshotRefreshScheduler refreshScheduler = new AdaptiveSnapshotRefreshScheduler(this::updateSnapshot);
+
+    /** Lock protecting snapshot reads/writes. */
+    protected final ReadWriteLock lock = new ReentrantReadWriteLock();
+
+    // ---- Cached grid node (avoids repeated AE2 graph traversal) ----
+    private volatile IGridNode cachedGridNode;
+
+    /**
+     * Returns the cached grid node, refreshing from the proxy if stale.
+     * <p>
+     * The cache is invalidated on {@link #invalidate()} and lazily refreshed
+     * on first access after invalidation — no need to call this every tick.
+     */
+    private IGridNode getCachedGridNode() {
+        if (cachedGridNode == null) {
+            cachedGridNode = getGridNode(AEPartLocation.UP);
+        }
+        return cachedGridNode;
+    }
+
+    @Override
+    public void onLoad() {
+        super.onLoad();
+        cachedGridNode = null; // force refresh on load
+        updateSnapshot();
+    }
+
+    /**
+     * Invalidates the cached grid node when this tile is removed or invalidated.
+     */
+    @Override
+    public void invalidate() {
+        super.invalidate();
+        cachedGridNode = null;
+    }
+
+    // ---- Inventory construction ----
+    @Override
+    public IOInventory buildInventory() {
+        int[] slotIndices = new int[SLOT_COUNT];
+        Arrays.setAll(slotIndices, i -> i);
+        IOInventory inv = new IOInventory(this, slotIndices, new int[0]);
+        // Each slot can hold one unique item type up to AE2's internal cap.
+        inv.setStackLimit(Integer.MAX_VALUE, slotIndices);
+        return inv;
+    }
+
+    // ---- Visual identity ----
+    @Nonnull
+    @Override
+    public ItemStack getVisualItemStack() {
+        return new ItemStack(ModularMachineryGreggeningBlocks.blockAdvancedMEItemInputBus);
+    }
+
+    // ---- Snapshot logic ----
+    /**
+     * Updates the snapshot by querying AE2's storage grid.
+     * <p>
+     * Single read-only call to getAvailableItems() — no repeated lookups.
+     */
+    protected void updateSnapshot() {
+        Optional<IMEInventory<IAEItemStack>> optInventory = getStorageInventory();
+        if (!optInventory.isPresent()) {
+            return;
+        }
+
+        IItemList<IAEItemStack> availableItems = new appeng.util.item.ItemList();
+        optInventory.get().getAvailableItems(availableItems);
+
+        // Select top 16 by quantity
+        List<IAEItemStack> newSnapshot = SelectTop16.select(availableItems);
+        lock.writeLock().lock();
+        try {
+            snapshot = newSnapshot;
+            refreshScheduler.recordSuccess();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Gets the AE2 storage inventory via inherited proxy and channel.
+     */
+    protected Optional<IMEInventory<IAEItemStack>> getStorageInventory() {
+        IGridNode gridNode = getCachedGridNode();
+        if (gridNode == null) {
+            return Optional.empty();
+        }
+
+        IGrid grid = gridNode.getGrid();
+        IStorageGrid storage = grid.getCache(IStorageGrid.class);
+        return Optional.ofNullable(storage.getInventory(channel));
+    }
+
+    /**
+     * Drains items from AE2 into the bus's internal inventory slots.
+     * <p>
+     * Called once per poll cycle by {@link #tickingRequest} after snapshot refresh.
+     * Rules:
+     * <ul>
+     *   <li>Slot holds less than Integer.MAX_VALUE → merge matching items into existing slot</li>
+     *   <li>Merge would exceed cap → extract up to Integer.MAX_VALUE</li>
+     *   <li>Slot already at Integer.MAX_VALUE → skip that slot entirely</li>
+     * </ul>
+     * </p>
+     * Thread affinity: safe on the AE2 grid tick thread (server main thread). When invoked
+     * via {@link AdaptiveSnapshotRefreshScheduler} through {@code addSyncTask()}, execution is
+     * forced onto the server main thread by MMCE's sync bridge. Do not call from worker threads.
+     */
+    public void drainIntoInventory() {
+        // ---- Phase 0 — snapshot copy under read lock (minimal critical section). ----
+        // Copy the snapshot reference and build a local map so we never hold the
+        // read lock while calling AE2 I/O methods. This prevents deadlocks if AE2
+        // callbacks attempt to acquire the write lock, and avoids serialising all
+        // snapshot updates during drain cycles.
+        List<IAEItemStack> snap;
+        HashMap<Item, IAEItemStack> snapByItem;
+        lock.readLock().lock();
+        try {
+            snap = snapshot;
+            if (snap == null || snap.isEmpty()) {
+                return; // early exit — no drain needed
+            }
+            snapByItem = new HashMap<>(snap.size());
+            for (IAEItemStack s : snap) {
+                if (s != null && s.getItem() != null) {
+                    snapByItem.put(s.getItem(), s);
+                }
+            }
+        } finally {
+            lock.readLock().unlock();
+        }
+
+        // ---- Phase 0b — collect AEItemStacks of items already in non-empty slots. ----
+        int slots = inventory != null ? inventory.getSlots() : 0;
+        List<IAEItemStack> occupiedStacks = new ArrayList<>();
+        for (int i = 0; i < slots; i++) {
+            ItemStack s = inventory.getStackInSlot(i);
+            if (!s.isEmpty()) {
+                occupiedStacks.add(appeng.util.item.AEItemStack.fromItemStack(s));
+            }
+        }
+
+        // ---- Phase 1 — merge matching items into existing non-empty slots. ----
+        for (int i = 0; i < slots; i++) {
+            ItemStack cur = inventory.getStackInSlot(i);
+            if (cur.isEmpty()) continue;
+
+            long slotLimit = inventory.getSlotLimit(i);
+            if (cur.getCount() >= slotLimit) {
+                continue;
+            }
+
+            // Find a snapshot entry that matches this slot's stack exactly (including NBT).
+            IAEItemStack src = null;
+            for (IAEItemStack s : snapByItem.values()) {
+                if (s != null && Objects.equals(appeng.util.item.AEItemStack.fromItemStack(cur), s)) {
+                    src = s;
+                    break;
+                }
+            }
+            if (src == null) continue;
+
+            long canFit = slotLimit - cur.getCount();
+            IAEItemStack toDrain = src.copy();
+            long drainAmount = Math.min(src.getStackSize(), canFit);
+            toDrain.setStackSize(drainAmount);
+
+            // AE2 I/O — no locks held.
+            IAEItemStack extracted = appeng.api.AEApi.instance().storage()
+                    .poweredExtraction(getEnergyGrid(), getMEInventory(), toDrain, source, Actionable.MODULATE);
+            if (extracted != null && extracted.getStackSize() > 0) {
+                cur.grow((int) extracted.getStackSize());
+                inventory.setStackInSlot(i, cur);
+                snapByItem.remove(src.getItem()); // remove so Phase 2 won't re-assign
+            }
+        }
+
+        // ---- Phase 2 — fill empty slots with remaining snapshot items. ----
+        for (int i = 0; i < slots; i++) {
+            if (!inventory.getStackInSlot(i).isEmpty()) continue;
+
+            long slotLimit = inventory.getSlotLimit(i);
+            if (slotLimit <= 0) continue;
+
+            for (Item item : new ArrayList<>(snapByItem.keySet())) {
+                IAEItemStack src = snapByItem.get(item);
+                if (src == null || src.getItem() == null) continue;
+
+                // Skip if this exact variant (item + NBT) already exists in another slot.
+                boolean alreadyOccupied = false;
+                for (IAEItemStack occupied : occupiedStacks) {
+                    if (occupied.equals(src)) {
+                        alreadyOccupied = true;
+                        break;
+                    }
+                }
+                if (alreadyOccupied) continue;
+
+                IAEItemStack toDrain = src.copy();
+                long drainAmount = Math.min(src.getStackSize(), slotLimit);
+                toDrain.setStackSize(drainAmount);
+
+                // AE2 I/O — no locks held.
+                IAEItemStack extracted = appeng.api.AEApi.instance().storage()
+                        .poweredExtraction(getEnergyGrid(), getMEInventory(), toDrain, source, Actionable.MODULATE);
+                if (extracted != null && extracted.getStackSize() > 0) {
+                    inventory.setStackInSlot(i, extracted.createItemStack());
+                    snapByItem.remove(item);
+                    break;
+                }
+            }
+        }
+    }
+
+    private final Object slotStateLock = new Object();
+
+    /**
+     * Reads changedSlots with proper synchronization.
+     */
+    private boolean[] readChangedSlots() {
+        synchronized (slotStateLock) {
+            return Arrays.copyOf(changedSlots, changedSlots.length);
+        }
+    }
+
+    /**
+     * Writes a single slot's changed flag with proper synchronization.
+     */
+    private void markSlotChanged(int slot) {
+        synchronized (slotStateLock) {
+            if (slot >= 0 && slot < changedSlots.length) {
+                changedSlots[slot] = true;
+            }
+        }
+    }
+
+    private int[] readFailureCounter() {
+        synchronized (slotStateLock) {
+            return Arrays.copyOf(failureCounter, failureCounter.length);
+        }
+    }
+
+    @Override
+    protected synchronized int[] getNeedUpdateSlots() {
+        long current = world.getTotalWorldTime();
+        if (lastFullCheckTick + 100 < current) {
+            lastFullCheckTick = current;
+            return java.util.stream.IntStream.range(0, inventory.getSlots()).toArray();
+        }
+        boolean[] changed = readChangedSlots();
+        int[] failures = readFailureCounter();
+        int bound = changed.length;
+        int count = 0;
+        for (int i = 0; i < bound; i++) {
+            if (changed[i] && failures[i] <= 0) {
+                count++;
+            }
+        }
+        int[] result = new int[count];
+        int idx = 0;
+        for (int i = 0; i < bound; i++) {
+            if (changed[i] && failures[i] <= 0) {
+                result[idx++] = i;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Resolves the AE2 energy grid from the cached node.
+     */
+    private IEnergyGrid getEnergyGrid() {
+        IGridNode node = getCachedGridNode();
+        if (node == null || !node.isActive()) {
+            return null;
+        }
+        return node.getGrid().getCache(IEnergyGrid.class);
+    }
+
+    /**
+     * Resolves the AE2 storage inventory from the cached node.
+     */
+    private IMEInventory<IAEItemStack> getMEInventory() {
+        IGridNode node = getCachedGridNode();
+        if (node == null || !node.isActive()) {
+            return null;
+        }
+        IStorageGrid storage = node.getGrid().getCache(IStorageGrid.class);
+        return storage.getInventory(channel);
+    }
+
+    // ---- IGridTickable implementation ----
+
+    @Nonnull
+    @Override
+    public TickingRequest getTickingRequest(@Nonnull IGridNode node) {
+        return new TickingRequest(1, Integer.MAX_VALUE, false, true);
+    }
+
+    @Nonnull
+    @Override
+    public TickRateModulation tickingRequest(@Nonnull IGridNode node, int ticksSinceLast) {
+        // Check if AE2 channel is active — if not, do nothing
+        IGridNode tickNode = getCachedGridNode();
+        boolean channelActive = tickNode != null && tickNode.isActive() && tickNode.meetsChannelRequirements();
+        if (!channelActive) {
+            return TickRateModulation.SAME;
+        }
+
+        tickCounter += ticksSinceLast;
+
+        // Only update snapshot at or after the polling interval boundary.
+        // The write lock is held across both updateSnapshot and drainIntoInventory
+        // to prevent a concurrent adaptive refresh (triggered by maybeScheduleRefresh)
+        // from swapping the snapshot mid-drain, which would break the semantic invariant
+        // that drain operates on the snapshot taken immediately before it.
+        if (tickCounter >= pollingIntervalTicks) {
+            tickCounter = 0;
+            lock.writeLock().lock();
+            try {
+                updateSnapshot();
+
+                // Drain items into inventory slots after snapshot
+                drainIntoInventory();
+            } finally {
+                lock.writeLock().unlock();
+            }
+
+            refreshScheduler.maybeScheduleRefresh();
+        }
+
+        return TickRateModulation.SAME;
+    }
+
+    // ---- MachineComponentTile implementation ----
+
+    /**
+     * Provides a standard MachineComponent.ItemBus(IOType.INPUT) that wraps this tile's inventory.
+     */
+    @Nullable
+    @Override
+    public MachineComponent<?> provideComponent() {
+        return new MachineComponent.ItemBus(IOType.INPUT) {
+            @Nonnull
+            @Override
+            public IOInventory getContainerProvider() {
+                return AdvancedMEItemInputBus.this.inventory;
+            }
+
+            @Override
+            public boolean isAsyncSupported() {
+                return true;
+            }
+        };
+    }
+
+    // ---- Configurable polling interval ----
+    /**
+     * Gets the current polling interval in ticks.
+     */
+    public int getPollingIntervalTicks() {
+        return pollingIntervalTicks;
+    }
+
+    /**
+     * Sets the polling interval in ticks (clamped to valid range).
+     */
+    public void setPollingIntervalTicks(int ticks) {
+        this.pollingIntervalTicks = Math.max(MIN_POLLING_INTERVAL_TICKS, Math.min(MAX_POLLING_INTERVAL_TICKS, ticks));
+    }
+
+    /**
+     * Forces an immediate snapshot and drain — used for manual re-scan from GUI.
+     * <p>
+     * Thread affinity: safe on the AE2 grid tick thread (server main thread). When invoked
+     * from a GUI action handler, ensure the call is routed through MMCE's {@code addSyncTask()}
+     * to land on the server main thread. Do not call directly from worker threads.
+     */
+    public void forceRescan() {
+        updateSnapshot();
+
+        // Drain items into inventory slots after snapshot
+        drainIntoInventory();
+
+        // Schedule adaptive background refresh if idle time warrants it.
+        refreshScheduler.maybeScheduleRefresh();
+    }
+
+    // ---- NBT serialization ----
+    /**
+     * Overrides the base deserialization to resize tracking arrays before setting up the listener.
+     * <p>
+     * The base MEItemBus.readInventoryNBT() replaces the inventory with a new IOInventory from NBT,
+     * then sets up a listener callback that writes to changedSlots[slot]. If the saved NBT contains
+     * more slots than what buildInventory() originally created, the listener throws ArrayIndexOutOfBoundsException.
+     * This override resizes changedSlots and failureCounter to match the deserialized inventory's slot count
+     * before the listener is registered.
+     */
+    @Override
+    public void readInventoryNBT(net.minecraft.nbt.NBTTagCompound tag) {
+        this.inventory = hellfirepvp.modularmachinery.common.util.IOInventory.deserialize(this, tag);
+        final int newSlotCount = inventory.getSlots();
+
+        // Resize tracking arrays to match the deserialized inventory's slot count.
+        if (newSlotCount != changedSlots.length) {
+            boolean[] newChanged = new boolean[newSlotCount];
+            System.arraycopy(changedSlots, 0, newChanged, 0, Math.min(changedSlots.length, newSlotCount));
+            changedSlots = newChanged;
+        }
+        if (newSlotCount != failureCounter.length) {
+            int[] newFailure = new int[newSlotCount];
+            System.arraycopy(failureCounter, 0, newFailure, 0, Math.min(failureCounter.length, newSlotCount));
+            failureCounter = newFailure;
+        }
+
+        this.inventory.setListener(this::markSlotChanged);
+
+        // Re-apply stack limit after deserialization — the parent's deserialize()
+        // resets limits to defaults (64). Restore AE2-cap unlimited stacks.
+        int[] allSlots = new int[inventory.getSlots()];
+        Arrays.setAll(allSlots, i -> i);
+        inventory.setStackLimit(Integer.MAX_VALUE, allSlots);
+    }
+
+    @Override
+    public void readCustomNBT(net.minecraft.nbt.NBTTagCompound nbt) {
+        super.readCustomNBT(nbt);
+        if (nbt.hasKey("pollingInterval")) {
+            this.pollingIntervalTicks = nbt.getInteger("pollingInterval");
+        }
+    }
+
+    @Override
+    public void writeCustomNBT(net.minecraft.nbt.NBTTagCompound nbt) {
+        super.writeCustomNBT(nbt);
+        nbt.setInteger("pollingInterval", this.pollingIntervalTicks);
+    }
+}
