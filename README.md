@@ -25,7 +25,7 @@ If you encounter a bug or want to suggest a feature, please [open an issue](http
 
 ## Credits & Licenses
 
-- Special thanks to Alecsio and **[MMCE:Addons](https://www.curseforge.com/minecraft/mc-mods/modular-machinery-community-edition-addons)** for the scaffolding of this project
+- Special thanks to Alecsio and **[MMCE:Addons](https://www.curseforge.com/minecraft/mc-mods/modular-machinery-community-edition-greggening)** for the scaffolding of this project
 - Some assets adapted from **MMCE**.
 
 ---
